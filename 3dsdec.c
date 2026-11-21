@@ -16,10 +16,13 @@
 #define NO_CRYPTO 4
 #define FIXED_KEY 1
 #define SEED_CRYPTO 0x20
+struct seed_entry { uint64_t title; uint8_t seed[16]; };
 struct keys {
     uint8_t x[64][16], common[256][16], title[16], fixed[16];
     unsigned char have_x[64], have_common[256];
     int have_title, have_fixed;
+    struct seed_entry *seeds;
+    unsigned seed_count;
 };
 struct content { uint64_t off, size; uint16_t index, type; uint8_t *record; };
 struct image {
@@ -242,8 +245,13 @@ static void scramble(const uint8_t x[16], const uint8_t y[16], uint8_t key[16]) 
     const __uint128_t c=((__uint128_t)UINT64_C(0x1ff9e9aac5fe0408)<<64)|UINT64_C(0x024591dc5d52768a);
     store128(rol((rol(load128(x),2)^load128(y))+c,87),key);
 }
+static const uint8_t *find_seed(const struct keys *keys, uint64_t title) {
+    for (unsigned i = 0; i < keys->seed_count; ++i)
+        if (keys->seeds[i].title == title) return keys->seeds[i].seed;
+    return NULL;
+}
+
 static int ncch_keys(const struct ncch *n, const struct keys *keys, uint8_t primary[16], uint8_t secondary[16]) {
-    if (n->h[0x18f]&SEED_CRYPTO) return error("seed crypto is unsupported; a seed-aware backend is required");
     if (n->h[0x18f]&FIXED_KEY) {
         if (le64(n->h+0x118)&(UINT64_C(1)<<36)) {
             if (!keys->have_fixed) return error("missing fixedSystemKey in --keys file");
@@ -259,7 +267,23 @@ static int ncch_keys(const struct ncch *n, const struct keys *keys, uint8_t prim
     }
     if (!keys->have_x[0x2c]) return error("missing NCCH KeyX 0x2C; supply --boot9 or --keys");
     if (!keys->have_x[slot]) return error("missing slot0x%02XKeyX in --keys file",slot);
-    scramble(keys->x[0x2c],n->h,primary); scramble(keys->x[slot],n->h,secondary); return 0;
+
+    uint8_t keyy[16];
+    memcpy(keyy, n->h, 16);
+    if (n->h[0x18f] & SEED_CRYPTO) {
+        uint64_t tid = be64(n->h + 0x118);
+        const uint8_t *seed = find_seed(keys, tid);
+        if (!seed)
+            return error("seed for title %016llX not found; supply --seeddb",
+                         (unsigned long long)tid);
+        uint8_t in[32], hash[32];
+        memcpy(in, n->h, 16);
+        memcpy(in + 16, seed, 16);
+        SHA256(in, sizeof in, hash);
+        memcpy(keyy, hash, 16);
+    }
+
+    scramble(keys->x[0x2c],n->h,primary); scramble(keys->x[slot],keyy,secondary); return 0;
 }
 static int title_key(const struct image *img, const struct keys *keys, uint8_t key[16]) {
     if (keys->have_title) { memcpy(key,keys->title,16); return 0; }
@@ -349,6 +373,29 @@ static char *trim(char *s) {
     while (n && strchr(" \t\r\n",s[n-1])) s[--n]=0;
     return s;
 }
+static int load_seeddb(const char *path, struct keys *keys) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return error("cannot open seeddb: %s", strerror(errno));
+    uint8_t hdr[16];
+    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr) { fclose(f); return error("seeddb too short"); }
+    uint32_t count = le32(hdr);
+    if (count > 100000) { fclose(f); return error("seeddb count looks invalid"); }
+    keys->seeds = calloc(count ? count : 1, sizeof(*keys->seeds));
+    if (!keys->seeds) { fclose(f); return error("out of memory"); }
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t e[32];
+        if (fread(e, 1, sizeof e, f) != sizeof e) {
+            fclose(f);
+            return error("seeddb truncated at entry %u", i);
+        }
+        keys->seeds[i].title = le64(e);
+        memcpy(keys->seeds[i].seed, e + 8, 16);
+    }
+    fclose(f);
+    keys->seed_count = count;
+    return 0;
+}
+
 static int load_keys(const char *path, struct keys *keys) {
     FILE *f=fopen(path,"r"); if (!f) return error("cannot open key file: %s",strerror(errno));
     char line[512]; int result=0;
@@ -577,14 +624,21 @@ static int copy_range(FILE *in, uint64_t off, uint64_t size, const char *dest) {
     if (fclose(out)) { unlink(dest); return error("closing %s failed", dest); }
     return 0;
 }
-/* Install a decrypted DLC CIA into Azahar's emulated NAND, matching
- * Service::AM::GetTitleContentPath: title/<high>/<low>/content/<cid>.app,
- * with the 00000000/ subdirectory when the TMD marks content 1 Optional. */
-static int install_dlc(FILE *in, struct image *img, const struct keys *keys, const char *userdir) {
-    if (!img->cia) return error("--install-dlc expects a CIA");
+/* Install a decrypted add-on (DLC) or update CIA into Azahar's emulated
+ * storage, matching Service::AM::GetTitleContentPath:
+ *   title/<high>/<low>/content/<cid>.app, 00000000/ when content 1 is Optional.
+ * DLC lives on SDMC (media_type=1), updates live in NAND (media_type=0);
+ * both tickets go to the NAND dbs. */
+static int install_title(FILE *in, struct image *img, const struct keys *keys,
+                         const char *userdir, int dlc) {
+    if (!img->cia) return error(dlc ? "--install-dlc expects a CIA"
+                                    : "--install-update expects a CIA");
     uint64_t tid = be64(img->body + 0x4c);
-    if ((uint32_t)(tid >> 32) != 0x0004008c)
+    uint32_t hi = (uint32_t)(tid >> 32);
+    if (dlc && hi != 0x0004008c)
         return error("not a DLC title (title id %016llX)", (unsigned long long)tid);
+    if (!dlc && hi != 0x0004000e)
+        return error("not an update title (title id %016llX)", (unsigned long long)tid);
     char tmp[4096];
     snprintf(tmp, sizeof tmp, "%s/.3dsdec-dlc-XXXXXX", userdir);
     int fd = mkstemp(tmp);
@@ -600,11 +654,17 @@ static int install_dlc(FILE *in, struct image *img, const struct keys *keys, con
     int subdir = count > 1 && (be16(d.body + 0x9c4 + 48 + 6) & 0x4000);
     char dir[4096];
     /* DLC (AddOnContents) live on SDMC, not NAND: am:GetDLCTitleInfos(media_type=1)
-     * resolves title/<hi>/<lo> under sdmc/Nintendo 3DS/<system id>/<sdcard id>/. */
-    snprintf(dir, sizeof dir,
-             "%s/sdmc/Nintendo 3DS/00000000000000000000000000000000/"
-             "00000000000000000000000000000000/title/%08x/%08x/content",
-             userdir, (unsigned)(tid >> 32), (unsigned)tid);
+     * resolves title/<hi>/<lo> under sdmc/Nintendo 3DS/<system id>/<sdcard id>/.
+     * Updates are NAND titles (media_type=0): nand/<id>/title/<hi>/<lo>/. */
+    if (dlc)
+        snprintf(dir, sizeof dir,
+                 "%s/sdmc/Nintendo 3DS/00000000000000000000000000000000/"
+                 "00000000000000000000000000000000/title/%08x/%08x/content",
+                 userdir, (unsigned)(tid >> 32), (unsigned)tid);
+    else
+        snprintf(dir, sizeof dir,
+                 "%s/nand/00000000000000000000000000000000/title/%08x/%08x/content",
+                 userdir, (unsigned)(tid >> 32), (unsigned)tid);
     if (mkdir_p(dir)) goto done;
     char path[8192];
     snprintf(path, sizeof path, "%s/00000000.tmd", dir);
@@ -625,8 +685,8 @@ static int install_dlc(FILE *in, struct image *img, const struct keys *keys, con
                  be32(c->record));
         if (copy_range(dec, c->off, c->size, path)) goto done;
     }
-    fprintf(stderr, "3dsdec: installed DLC %016llX (%u contents) under %s\n",
-            (unsigned long long)tid, count, dir);
+    fprintf(stderr, "3dsdec: installed %s %016llX (%u contents) under %s\n",
+            dlc ? "DLC" : "update", (unsigned long long)tid, count, dir);
     if (img->ticket && img->ticket_size) {
         char tdir[4096], tpath[8192];
         snprintf(tdir, sizeof tdir,
@@ -819,14 +879,18 @@ static void usage(void) {
     fputs("usage:\n  3dsdec --check INPUT\n  3dsdec --decrypt INPUT OUTPUT [--boot9 FILE] [--keys FILE] [--titlekey FILE]\n"
           "Input/output: CIA stays CIA, CCI stays CCI. Existing files are never overwritten.\n"
           "--keys: slot0x2CKeyX/slot0x25KeyX/slot0x18KeyX/slot0x1BKeyX, commonN (normal AES key), fixedSystemKey\n"
+          "--seeddb: seeddb.bin for seed-encrypted titles\n"
           "Each entry: name = 32 hex digits. --titlekey: a 16-byte decrypted CIA titlekey.\n"
           " 3dsdec --install-dlc DLC.cia USERDIR [keys...]   # DLC -> emulated SDMC, ticket -> NAND dbs\n"
+          " 3dsdec --install-update UPDATE.cia USERDIR [keys...] # update -> NAND title\n"
           "Seed crypto and prototype NCCH v1 are not supported. No keys are embedded.\n",stderr);
 }
 int main(int argc, char **argv) {
     if (argc<3) { usage(); return 2; }
     int check=!strcmp(argv[1],"--check"), dec=!strcmp(argv[1],"--decrypt");
-    int install=!strcmp(argv[1],"--install-dlc"), font=!strcmp(argv[1],"--install-font");
+    int install=!strcmp(argv[1],"--install-dlc") || !strcmp(argv[1],"--install-update");
+    int install_is_dlc=!strcmp(argv[1],"--install-dlc");
+    int font=!strcmp(argv[1],"--install-font");
     if ((!check && !dec && !install && !font) || (check && argc!=3) ||
         ((dec || install) && (argc<4 || argc%2)) || (font && argc!=4)) { usage(); return 2; }
     if (font) return install_font(argv[2],argv[3]) ? 2 : 0;
@@ -834,6 +898,7 @@ int main(int argc, char **argv) {
     for (int i=4;(dec || install) && i<argc;i+=2) {
         int r;
         if (!strcmp(argv[i],"--keys")) r=load_keys(argv[i+1],&keys);
+        else if (!strcmp(argv[i],"--seeddb")) r=load_seeddb(argv[i+1],&keys);
         else if (!strcmp(argv[i],"--boot9")) r=load_boot9(argv[i+1],&keys);
         else if (!strcmp(argv[i],"--titlekey")) r=load_titlekey(argv[i+1],&keys);
         else { usage(); return 2; }
@@ -847,7 +912,7 @@ int main(int argc, char **argv) {
         else if (install) {
             struct stat st;
             if (stat(argv[3], &st) || !S_ISDIR(st.st_mode)) error("install destination is not a directory");
-            else result = install_dlc(in, &img, &keys, argv[3]) ? 2 : 0;
+            else result = install_title(in, &img, &keys, argv[3], install_is_dlc) ? 2 : 0;
         }
         else {
             const char *ext=strrchr(argv[3],'.');
